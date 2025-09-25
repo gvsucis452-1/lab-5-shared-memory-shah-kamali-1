@@ -1,0 +1,240 @@
+Q1
+A1: 
+printf("Value a: %p\t Value b: %p\n", sharedMemoryPtr, sharedMemoryPtr + SHM_SIZE);
+Value a is the base virtual address where the shared segment is attached in this process.
+Value b is one-past-the-end (base + size). It does not point to valid data, it shows the upper bound of the mapped region.
+
+Q2:
+A2: 
+key: IPC_PRIVATE → ask the kernel to create a brand-new, private segment with a new ID.
+size: SHM_SIZE → requested segment size in bytes (kernel may round up to page size).
+shmflg: bitwise OR of flags:
+IPC_CREAT → create if it doesn’t exist.
+S_IRUSR | S_IWUSR → user read/write permission (0600).
+
+Q3:
+A3:
+IPC_STAT: fill a struct shmid_ds with metadata (segment size, creator pid, attach count, last op time, permissions, etc.).
+IPC_RMID: mark the segment for removal (it disappears after the last process detaches).
+
+Q4:
+A4:
+First SS and Second SS for the proof is in the repo.
+
+
+Programming Assignment (Readers and Writer)
+
+/**********************************************************
+ * shm_demo.h - common defs for the two readers + writer
+Shah Kamali
+ **********************************************************/
+#ifndef SHM_DEMO_H
+#define SHM_DEMO_H
+
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <signal.h>
+#include <stddef.h>
+
+#define MAXLEN 1024
+#define NUM_READERS 2
+#define PERMS  (S_IRUSR | S_IWUSR)   // 0600
+#define PROJ_ID  'S'                 // for ftok()
+
+typedef struct {
+    volatile sig_atomic_t ready;                 // 0: idle, 1: new line available
+    volatile sig_atomic_t seen[NUM_READERS];     // per-reader "I printed it" flag
+    volatile sig_atomic_t shutdown;              // 1: writer is done; readers should exit
+    size_t len;                                  // bytes of valid data in buf
+    char buf[MAXLEN];                            // text data
+} shmregion_t;
+
+#endif
+
+
+/**********************************************************
+ * writer.c — System V shared memory writer (2-reader lockstep)
+Shah Kamali
+ **********************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include "shm_demo.h"
+
+static int shmId = -1;
+static shmregion_t *shm = NULL;
+
+static void cleanup_and_exit(int code) {
+    if (shm) { shmdt((void*)shm); shm = NULL; }
+    if (shmId != -1) { shmctl(shmId, IPC_RMID, 0); shmId = -1; }
+    exit(code);
+}
+
+static void on_signal(int sig) {
+    // Try to notify readers then clean up
+    if (shm) shm->shutdown = 1;
+    cleanup_and_exit(0);
+}
+
+int main(int argc, char **argv) {
+    // Ensure a stable ftok path exists (a tiny token file in cwd)
+    const char *token_path = "./shmkey.token";
+    FILE *f = fopen(token_path, "a");
+    if (f) fclose(f);  // touch-like behavior
+
+    key_t key = ftok(token_path, PROJ_ID);
+    if (key == (key_t)-1) { perror("ftok"); exit(1); }
+
+    // Create the segment (or get existing)
+    shmId = shmget(key, sizeof(shmregion_t), IPC_CREAT | PERMS);
+    if (shmId == -1) { perror("shmget"); exit(1); }
+
+    shm = (shmregion_t*)shmat(shmId, NULL, 0);
+    if (shm == (void*)-1) { perror("shmat"); exit(1); }
+
+    // Initialize shared region
+    shm->ready = 0;
+    shm->shutdown = 0;
+    for (int i = 0; i < NUM_READERS; ++i) shm->seen[i] = 1;  // nothing pending
+
+    // Handle signals for graceful cleanup
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    printf("[writer] shmId=%d  key=0x%08x\n", shmId, (unsigned int)key);
+    printf("[writer] Type lines to broadcast. Type 'quit' to exit.\n");
+
+    char line[MAXLEN];
+    while (1) {
+        // Wait until previous line fully seen by both readers
+        while (shm->ready) {
+            // busy-wait lightly
+            usleep(1000);
+        }
+
+        // Get next input
+        if (!fgets(line, sizeof(line), stdin)) {
+            // EOF: initiate shutdown
+            shm->shutdown = 1;
+            break;
+        }
+        // Trim newline
+        size_t L = strlen(line);
+        if (L && line[L-1] == '\n') line[--L] = '\0';
+
+        // Check for quit
+        if (strcmp(line, "quit") == 0) {
+            shm->shutdown = 1;
+            // Do not set ready; just let readers notice shutdown and exit
+            break;
+        }
+
+        // Publish
+        strncpy(shm->buf, line, MAXLEN-1);
+        shm->buf[MAXLEN-1] = '\0';
+        shm->len = strnlen(shm->buf, MAXLEN);
+        shm->seen[0] = 0;
+        shm->seen[1] = 0;
+        shm->ready = 1;
+
+        // Wait until both readers consume
+        while (shm->ready && (!shm->seen[0] || !shm->seen[1])) {
+            usleep(1000);
+        }
+        // Clear ready for next input
+        shm->ready = 0;
+    }
+
+    // Final: wait for any in-flight message to be seen
+    while (shm->ready && (!shm->seen[0] || !shm->seen[1])) {
+        usleep(1000);
+    }
+
+    // Remove segment and exit
+    cleanup_and_exit(0);
+}
+
+
+/**********************************************************
+ * reader.c — System V shared memory reader (index 0 or 1)
+ * Usage: ./reader 0   or   ./reader 1
+Shah Kamali
+ **********************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <unistd.h>
+#include "shm_demo.h"
+
+static shmregion_t *shm = NULL;
+
+static void on_signal(int sig) {
+    if (shm) shmdt((void*)shm);
+    exit(0);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <reader_index: 0 or 1>\n", argv[0]);
+        return 1;
+    }
+    int idx = atoi(argv[1]);
+    if (idx < 0 || idx >= NUM_READERS) {
+        fprintf(stderr, "Reader index must be 0 or 1\n");
+        return 1;
+    }
+
+    const char *token_path = "./shmkey.token";
+    // Ensure token exists (not strictly necessary for reader if writer did it)
+    FILE *f = fopen(token_path, "a"); if (f) fclose(f);
+
+    key_t key = ftok(token_path, PROJ_ID);
+    if (key == (key_t)-1) { perror("ftok"); exit(1); }
+
+    int shmId = shmget(key, sizeof(shmregion_t), PERMS);
+    if (shmId == -1) {
+        perror("shmget (did you start the writer first?)");
+        exit(1);
+    }
+
+    shm = (shmregion_t*)shmat(shmId, NULL, 0);
+    if (shm == (void*)-1) { perror("shmat"); exit(1); }
+
+    // Signals: detach on exit
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    printf("[reader%d] attached. key=0x%08x\n", idx, (unsigned int)key);
+
+    int last_seen_ready = 0;
+    while (1) {
+        if (shm->shutdown) break;
+
+        // Wait for a new unread message
+        if (shm->ready && shm->seen[idx] == 0) {
+            // Consume once
+            fwrite(shm->buf, 1, shm->len, stdout);
+            fputc('\n', stdout);
+            fflush(stdout);
+
+            shm->seen[idx] = 1;
+
+            // Reader does NOT clear ready. Writer will do that after both readers set seen[*].
+        } else {
+            // nothing new; idle lightly
+            usleep(1000);
+        }
+    }
+
+    shmdt((void*)shm);
+    return 0;
+}
