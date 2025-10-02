@@ -3,6 +3,7 @@ A1:
 printf("Value a: %p\t Value b: %p\n", sharedMemoryPtr, sharedMemoryPtr + SHM_SIZE);
 Value a is the base virtual address where the shared segment is attached in this process.
 Value b is one-past-the-end (base + size). It does not point to valid data, it shows the upper bound of the mapped region.
+# zk Good catch on the "one past the end"
 
 Q2:
 A2: 
